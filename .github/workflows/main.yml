@@ -75,18 +75,16 @@ jobs:
 
       # ==========================================
       # TRIVY CONTAINER VULNERABILITY SCAN
-      # TEMPORARILY DISABLED
       # ==========================================
-      #
-       - name: Scan Docker Image with Trivy
-         uses: aquasecurity/trivy-action@v0.36.0
-         with:
-           image-ref: spring-petclinic:${{ github.sha }}
-           format: table
-           exit-code: '1'
-           ignore-unfixed: true
-           vuln-type: os,library
-           severity: HIGH,CRITICAL
+      - name: Scan Docker Image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: spring-petclinic:${{ github.sha }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
 
       # ==========================================
       # VALIDATE DOCKER HUB CREDENTIALS
@@ -141,9 +139,8 @@ jobs:
           echo "- Maven build and unit tests passed." >> "$GITHUB_STEP_SUMMARY"
           echo "- SonarQube Cloud analysis submitted." >> "$GITHUB_STEP_SUMMARY"
           echo "- Docker image built successfully." >> "$GITHUB_STEP_SUMMARY"
-          echo "- Trivy scan temporarily disabled." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Trivy vulnerability scan completed." >> "$GITHUB_STEP_SUMMARY"
           echo "- Docker image pushed to Docker Hub." >> "$GITHUB_STEP_SUMMARY"
-
 
   # ==========================================
   # CD - CONTINUOUS DEPLOYMENT
