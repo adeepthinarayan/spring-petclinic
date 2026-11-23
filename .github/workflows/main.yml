@@ -16,7 +16,7 @@ jobs:
   # CI - CONTINUOUS INTEGRATION
   # ==========================================
   ci:
-    name: CI - Build, Test and Push Docker Image
+    name: CI - Build, Test, Analyze and Push Docker Image
     runs-on: ubuntu-latest
 
     steps:
@@ -34,6 +34,29 @@ jobs:
         run: |
           chmod +x mvnw
           ./mvnw clean package -Dtest='!*IntegrationTests'
+
+      # ==========================================
+      # SONARQUBE CLOUD CODE ANALYSIS
+      # ==========================================
+
+      - name: Set up Java for SonarQube Scanner
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: SonarQube Cloud Analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          ./mvnw org.sonarsource.scanner.maven:sonar-maven-plugin:5.9.0.7382:sonar \
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }} \
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }} \
+            -Dsonar.host.url=https://sonarcloud.io
+
+      # ==========================================
+      # DOCKER BUILD AND PUSH
+      # ==========================================
 
       - name: Build Docker Image
         run: |
@@ -81,6 +104,10 @@ jobs:
       - name: Checkout Source Code
         uses: actions/checkout@v7
 
+      # ------------------------------------------
+      # INSTALL K3S
+      # ------------------------------------------
+
       - name: Install K3s
         run: |
           curl -sfL https://get.k3s.io | sh -
@@ -118,6 +145,10 @@ jobs:
 
           sudo k3s kubectl get nodes
 
+      # ------------------------------------------
+      # DEPLOY APPLICATION
+      # ------------------------------------------
+
       - name: Deploy Spring PetClinic
         run: |
           sudo k3s kubectl apply -f k8s/deployment.yaml
@@ -140,6 +171,10 @@ jobs:
 
           echo "=== Services ==="
           sudo k3s kubectl get services
+
+      # ------------------------------------------
+      # VERIFY APPLICATION
+      # ------------------------------------------
 
       - name: Verify Application
         run: |
@@ -174,7 +209,9 @@ jobs:
 
           echo "Application did not respond."
           cat /tmp/port-forward.log
+
           sudo k3s kubectl get pods -o wide
+
           sudo k3s kubectl logs deployment/spring-petclinic \
             --all-pods=true --tail=100 || true
 
@@ -266,6 +303,10 @@ jobs:
 
           echo "Public URL: $TUNNEL_URL"
 
+      # ------------------------------------------
+      # VERIFY PUBLIC ACCESS
+      # ------------------------------------------
+
       - name: Verify Public Application Access
         run: |
           echo "Testing public application URL..."
@@ -280,9 +321,15 @@ jobs:
           done
 
           echo "Public application access failed."
+
           cat /tmp/cloudflared.log
           cat /tmp/cloudflare-port-forward.log
+
           exit 1
+
+      # ------------------------------------------
+      # KEEP APPLICATION AVAILABLE
+      # ------------------------------------------
 
       - name: Keep Application Available for 2 Minutes
         run: |
@@ -292,6 +339,10 @@ jobs:
           sleep 120
 
           echo "Demo period completed."
+
+      # ------------------------------------------
+      # CD SUMMARY
+      # ------------------------------------------
 
       - name: CD Summary
         if: success()
