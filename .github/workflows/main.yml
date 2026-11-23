@@ -1,3 +1,4 @@
+
 name: Spring PetClinic CI/CD Pipeline
 
 on:
@@ -6,13 +7,16 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
 
   # ==========================================
   # CI - CONTINUOUS INTEGRATION
   # ==========================================
   ci:
-    name: CI - Build, Test and Security Scan
+    name: CI - Build, Test and Push Docker Image
     runs-on: ubuntu-latest
 
     steps:
@@ -36,6 +40,16 @@ jobs:
           docker build \
             -t spring-petclinic:${{ github.sha }} .
 
+      - name: Validate Docker Hub Credentials
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "Docker Hub credentials are missing."
+            exit 1
+          fi
+
       - name: Login to Docker Hub
         uses: docker/login-action@v4
         with:
@@ -53,3 +67,240 @@ jobs:
           docker push ${{ vars.DOCKERHUB_USERNAME }}/spring-petclinic:${{ github.sha }}
 
           docker push ${{ vars.DOCKERHUB_USERNAME }}/spring-petclinic:latest
+
+
+  # ==========================================
+  # CD - CONTINUOUS DEPLOYMENT
+  # ==========================================
+  cd:
+    name: CD - Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: ci
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v7
+
+      - name: Install K3s
+        run: |
+          curl -sfL https://get.k3s.io | sh -
+
+      - name: Wait for Kubernetes Cluster
+        run: |
+          echo "Waiting for K3s API server and Node resource..."
+
+          NODE_READY=false
+
+          for i in {1..60}; do
+            if sudo k3s kubectl get nodes >/dev/null 2>&1; then
+              NODE_COUNT=$(sudo k3s kubectl get nodes --no-headers 2>/dev/null | wc -l)
+
+              if [ "$NODE_COUNT" -gt 0 ]; then
+                NODE_READY=true
+                break
+              fi
+            fi
+
+            sleep 5
+          done
+
+          if [ "$NODE_READY" != "true" ]; then
+            echo "Kubernetes Node resource was not created."
+            sudo journalctl -u k3s --no-pager -n 100 || true
+            exit 1
+          fi
+
+          sudo k3s kubectl wait \
+            --for=condition=Ready \
+            nodes \
+            --all \
+            --timeout=180s
+
+          sudo k3s kubectl get nodes
+
+      - name: Deploy Spring PetClinic
+        run: |
+          sudo k3s kubectl apply -f k8s/deployment.yaml
+
+          sudo k3s kubectl set image deployment/spring-petclinic \
+            spring-petclinic=${{ vars.DOCKERHUB_USERNAME }}/spring-petclinic:${{ github.sha }}
+
+          sudo k3s kubectl apply -f k8s/service.yaml
+
+      - name: Verify Kubernetes Deployment
+        run: |
+          sudo k3s kubectl rollout status deployment/spring-petclinic \
+            --timeout=300s
+
+          echo "=== Deployments ==="
+          sudo k3s kubectl get deployments
+
+          echo "=== Pods ==="
+          sudo k3s kubectl get pods
+
+          echo "=== Services ==="
+          sudo k3s kubectl get services
+
+      - name: Verify Application
+        run: |
+          echo "Checking Spring PetClinic..."
+
+          SERVICE_PORT=$(sudo k3s kubectl get service spring-petclinic-service \
+            -o jsonpath='{.spec.ports[0].port}')
+
+          if [ -z "$SERVICE_PORT" ]; then
+            echo "Could not determine Kubernetes Service port."
+            exit 1
+          fi
+
+          sudo k3s kubectl port-forward \
+            service/spring-petclinic-service \
+            8080:${SERVICE_PORT} \
+            --address 127.0.0.1 \
+            >/tmp/port-forward.log 2>&1 &
+
+          PORT_FORWARD_PID=$!
+
+          trap 'kill "$PORT_FORWARD_PID" 2>/dev/null || true' EXIT
+
+          for i in {1..30}; do
+            if curl -fsS http://localhost:8080/ -o /dev/null; then
+              echo "Spring PetClinic is responding successfully."
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo "Application did not respond."
+          cat /tmp/port-forward.log
+          sudo k3s kubectl get pods -o wide
+          sudo k3s kubectl logs deployment/spring-petclinic \
+            --all-pods=true --tail=100 || true
+
+          exit 1
+
+      # ==========================================
+      # CLOUDFLARE TUNNEL
+      # ==========================================
+
+      - name: Install Cloudflare Tunnel
+        run: |
+          curl -L --fail --show-error \
+            -o cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+
+          sudo dpkg -i cloudflared.deb
+
+          cloudflared --version
+
+      - name: Start Cloudflare Tunnel
+        run: |
+          echo "Starting Kubernetes port-forward..."
+
+          SERVICE_PORT=$(sudo k3s kubectl get service spring-petclinic-service \
+            -o jsonpath='{.spec.ports[0].port}')
+
+          if [ -z "$SERVICE_PORT" ]; then
+            echo "Could not determine Kubernetes Service port."
+            exit 1
+          fi
+
+          nohup sudo k3s kubectl port-forward \
+            service/spring-petclinic-service \
+            8080:${SERVICE_PORT} \
+            --address 127.0.0.1 \
+            >/tmp/cloudflare-port-forward.log 2>&1 </dev/null &
+
+          echo "Waiting for local application endpoint..."
+
+          LOCAL_READY=false
+
+          for i in {1..30}; do
+            if curl -fsS http://localhost:8080/ -o /dev/null; then
+              LOCAL_READY=true
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ "$LOCAL_READY" != "true" ]; then
+            echo "Local application endpoint is unavailable."
+            cat /tmp/cloudflare-port-forward.log
+            exit 1
+          fi
+
+          echo "Starting Cloudflare Tunnel..."
+
+          nohup cloudflared tunnel \
+            --url http://localhost:8080 \
+            --no-autoupdate \
+            >/tmp/cloudflared.log 2>&1 </dev/null &
+
+          echo "Waiting for public HTTPS URL..."
+
+          TUNNEL_URL=""
+
+          for i in {1..30}; do
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+              /tmp/cloudflared.log | head -n 1 || true)
+
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "Cloudflare Tunnel failed to start."
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+
+          echo "PUBLIC_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
+
+          echo "## Public Application URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "[$TUNNEL_URL]($TUNNEL_URL)" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Public URL: $TUNNEL_URL"
+
+      - name: Verify Public Application Access
+        run: |
+          echo "Testing public application URL..."
+
+          for i in {1..12}; do
+            if curl -fsS "$PUBLIC_URL/" -o /dev/null; then
+              echo "Public application access successful."
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo "Public application access failed."
+          cat /tmp/cloudflared.log
+          cat /tmp/cloudflare-port-forward.log
+          exit 1
+
+      - name: Keep Application Available for 2 Minutes
+        run: |
+          echo "Public URL: $PUBLIC_URL"
+          echo "Keeping application available for 2 minutes..."
+
+          sleep 120
+
+          echo "Demo period completed."
+
+      - name: CD Summary
+        if: success()
+        run: |
+          echo "## CD Successful" >> "$GITHUB_STEP_SUMMARY"
+          echo "- K3s cluster created successfully." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Application deployed to Kubernetes." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Kubernetes rollout verified." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Application response verified." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Public HTTPS access verified." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Cloudflare Tunnel available for 2 minutes." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Public URL: $PUBLIC_URL" >> "$GITHUB_STEP_SUMMARY"
